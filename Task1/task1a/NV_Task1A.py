@@ -19,11 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          1568
+# Author List:      Priyansh Miyani
 # Filename:         ackermann_steering.py
 # Functions:        ackermann_wheel_angles
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: None
 
 
 ####################### IMPORT MODULES #######################
@@ -43,6 +43,9 @@ WHEEL_OFFSET = 0.0275       # O: distance between kingpin axis and wheel centre.
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
+def radius_from_angle(delta):
+  r=WHEELBASE/math.tan(abs(delta))#calculate the radius 
+  return r
 
 def ackermann_wheel_angles(delta):
     '''
@@ -66,10 +69,27 @@ def ackermann_wheel_angles(delta):
     REMEMBER:
     ---
     WHEEL_OFFSET changes the effective half-track width inside each wheel's triangle.
-    '''
-
-
-    return left_angle, right_angle
+        '''
+    if delta == 0: #checking if the desired steering angle is zero (straight)
+        return(0,0)
+    elif delta>0: #checking for a left turn
+        R= radius_from_angle(delta)
+        left=R-(TRACK_WIDTH-2*WHEEL_OFFSET)/2 #calculating radius for left wheel to turn left
+        right=R+(TRACK_WIDTH-2*WHEEL_OFFSET)/2#calculating radius for right wheel to turn left
+        
+        left_wheel_angle = math.atan(WHEELBASE/left)#calculating the angle for left wheel to turn left
+        right_wheel_angle = math.atan(WHEELBASE/right)#calculating the angle for right wheel to turn left
+        
+        return left_wheel_angle,right_wheel_angle
+    else : #otherwise, it is a right turn 
+        R = radius_from_angle(delta)
+        left=R+(TRACK_WIDTH-2*WHEEL_OFFSET)/2 #calculating radius for left wheel to turn right
+        right=R-(TRACK_WIDTH-2*WHEEL_OFFSET)/2 #calculating radius for right wheel to turn right
+        
+        left_wheel_angle = -math.atan(WHEELBASE/left)#calculating the angle for left wheel to turn right
+        right_wheel_angle = -math.atan(WHEELBASE/right)#calculating the angle for right wheel to turn right
+        
+        return left_wheel_angle,right_wheel_angle
 
 
 ##############################################################

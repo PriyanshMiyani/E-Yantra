@@ -19,8 +19,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          1568
+# Author List:      Priyansh Miyani
 # Filename:         path_tracking.py
 # Functions:        ackermann_wheel_angles, compute_steering
 
@@ -47,7 +47,9 @@ WHEEL_OFFSET = 0.0275       # O: distance between kingpin axis and wheel centre.
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
-
+def radius_from_angle(delta):
+  r=WHEELBASE/math.tan(abs(delta))#calculate the radius 
+  return r
 def ackermann_wheel_angles(delta):
     '''
     Purpose:
@@ -66,12 +68,30 @@ def ackermann_wheel_angles(delta):
     `left_wheel_angle`  : [ float ]  angle for the left front wheel, radians
     `right_wheel_angle` : [ float ]  angle for the right front wheel, radians
     '''
+    if delta == 0: #checking if the desired steering angle is zero (straight)
+        return(0,0)
+    elif delta>0: #checking for a left turn
+        R= radius_from_angle(delta)
+        left=R-(TRACK_WIDTH-2*WHEEL_OFFSET)/2 #calculating radius for left wheel to turn left
+        right=R+(TRACK_WIDTH-2*WHEEL_OFFSET)/2#calculating radius for right wheel to turn left
+        
+        left_wheel_angle = math.atan(WHEELBASE/left)#calculating the angle for left wheel to turn left
+        right_wheel_angle = math.atan(WHEELBASE/right)#calculating the angle for right wheel to turn left
+        
+        return left_wheel_angle,right_wheel_angle
+    else : #otherwise, it is a right turn 
+        R = radius_from_angle(delta)
+        left=R+(TRACK_WIDTH-2*WHEEL_OFFSET)/2 #calculating radius for left wheel to turn right
+        right=R-(TRACK_WIDTH-2*WHEEL_OFFSET)/2 #calculating radius for right wheel to turn right
+        
+        left_wheel_angle = -math.atan(WHEELBASE/left)#calculating the angle for left wheel to turn right
+        right_wheel_angle = -math.atan(WHEELBASE/right)#calculating the angle for right wheel to turn right
+        
+        return left_wheel_angle,right_wheel_angle
 
-    left_wheel_angle = 0
-    right_wheel_angle = 0
-
-    return left_wheel_angle, right_wheel_angle
-
+_integral_error = 0.0
+_previous_error = None
+_previous_target = None
 
 def compute_steering(target_y, current_values):
     '''
@@ -110,9 +130,59 @@ def compute_steering(target_y, current_values):
     no commanding the simulator - the control loop below does all of that.
     '''
 
-    steering = 0
-    return steering
+    global _integral_error
+    global _previous_error
+    global _previous_target
 
+    y = current_values["y"]
+    yaw = current_values["yaw"]
+    dt = current_values["dt"]
+
+    error = y - target_y
+
+    if _previous_target is None or target_y != _previous_target:
+        _integral_error = 0.0
+        _previous_error = error
+        _previous_target = target_y
+
+    if dt > 0:
+        derivative = (error - _previous_error) / dt
+    else:
+        derivative = 0.0
+
+    _previous_error = error
+
+    Kp = 9.5
+    Ki = 0.15
+    Kd = 0.015
+    Kpsi = 2.0
+
+    base_steering = (
+        Kp * error
+        + Kd * derivative
+        - Kpsi * yaw
+    )
+
+    if dt > 0:
+        candidate_integral = _integral_error + error * dt
+        candidate_integral = max(
+            -0.10, min(0.10, candidate_integral)
+        )
+
+        candidate_steering = (
+            base_steering + Ki * candidate_integral
+        )
+
+        if (
+            abs(candidate_steering) <= MAX_STEER
+            or (candidate_steering > MAX_STEER and error < 0)
+            or (candidate_steering < -MAX_STEER and error > 0)
+        ):
+            _integral_error = candidate_integral
+
+    steering = base_steering + Ki * _integral_error
+
+    return steering
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################

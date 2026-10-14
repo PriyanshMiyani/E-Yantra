@@ -1,0 +1,13 @@
+Running evaluation scripts for 2026 theme NV for task 2a
+
+Aborted!
+
+Recording Task 2A - lane navigation with stop logic.
+  submission : C:\Users\priya\eYRC_26-27_Niti-Vahan\task2a\task2a.py
+  Both laps are driven end to end. This takes a while - the vehicle
+  drives at its own pace and nothing is cut short. Leave CoppeliaSim
+  alone until it finishes.
+
+  --- lap on the outer lane ---
+    the simulation stopped unexpectedly - 1714 samples over 216s of simulation, 0/2 stops signalled
+  --- lap on the inner lane ---
