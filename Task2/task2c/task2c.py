@@ -19,11 +19,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          1568
+# Author List:      Dev Patel, Priyansh Miyani
 # Filename:         task2c.py
 # Functions:        parking_manoeuvre
-# Global variables: < List any global variables you add, "None" if you add none >
+# Global variables: _last_steering, _lost_frames, _parked_frames _last_pose, _progress_count, _crossing_done, _align_direction
 
 
 ####################### IMPORT MODULES #######################
@@ -67,7 +67,13 @@ BAY_WIDTH          = 0.22    # m - the vehicle is 0.18 m across
 ##############################################################
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
-
+_last_steering = 0.0 
+_lost_frames=0
+_parked_frames=0
+_last_pose=None
+_progress_count=0
+_crossing_done=False
+_align_direction=1.0
 def parking_manoeuvre(pose):
     '''
     Purpose:
@@ -134,8 +140,161 @@ def parking_manoeuvre(pose):
     '''
 
     # ADD YOUR CODE HERE
+    global _last_steering, _lost_frames, _parked_frames
+    global _last_pose, _progress_count, _crossing_done, _align_direction
 
-    return 0.0, 0.0, False
+    # A brief missing detection is normal; do not let one frame change the path.
+    if pose is None:
+        _lost_frames += 1
+        _parked_frames = 0
+        if _lost_frames <= 2 and _last_pose is not None:
+            return float(_last_steering), 0.04, False
+        _last_steering = 0.0
+        return 0.0, 0.0, False
+
+    _lost_frames = 0
+    try:
+        lateral = float(pose["lateral"])   # positive = vehicle LEFT of bay centreline
+        heading = float(pose["heading"])   # positive = nose points LEFT
+        forward = float(pose["forward"])
+        bearing = float(pose["bearing"])
+    except (KeyError, TypeError, ValueError):
+        _parked_frames = 0
+        return 0.0, 0.0, False
+
+    if not all(np.isfinite(v) for v in (lateral, heading, forward, bearing)):
+        _parked_frames = 0
+        return 0.0, 0.0, False
+
+    _last_pose = {"lateral": lateral, "heading": heading, "forward": forward, "bearing": bearing}
+    _progress_count += 1
+    far_bay = int(TARGET_ID) == 1
+    depth_error = forward - float(BAY_MIDDLE_FORWARD)
+
+    # Reference crossing: Bay 0 ~= 25 degrees; Bay 1 ~= 38.5 degrees.
+    # Once the vehicle reaches the centreline (lateral <= 8 mm), latch the
+    # crossing complete. Do not re-enter the fixed-angle crossing phase due to
+    # a noisy positive/negative lateral estimate on following frames.
+    crossing_heading = np.deg2rad(38.5 if far_bay else 25.0)
+    cross_deadline = float(BAY_MOUTH_FORWARD) + (0.018 if far_bay else 0.045)
+    if lateral <= 0.008:
+        _crossing_done = True
+
+    if not _crossing_done and lateral > 0.008 and forward > cross_deadline:
+        phase = "CROSS"
+        desired_heading = -crossing_heading
+        heading_gain = 1.55 if not far_bay else 1.45
+        lateral_gain = 0.20
+        steering_limit = np.deg2rad(29.0 if not far_bay else 37.0)
+        max_delta = np.deg2rad(13.0 if not far_bay else 15.0)
+    elif not _crossing_done:
+        # If the target line has not been reached by the preferred deadline,
+        # keep correcting towards a short lookahead point on the centreline.
+        phase = "CENTER"
+        lookahead = 0.25 if not far_bay else 0.29
+        desired_heading = -float(np.arctan2(lateral, lookahead))
+        heading_gain = 1.65
+        lateral_gain = 0.32
+        steering_limit = np.deg2rad(26.0 if not far_bay else 29.0)
+        max_delta = np.deg2rad(11.0)
+    else:
+        # Use a short lookahead while lateral error is appreciable to move the
+        # front axle onto the centreline. Once close to the line, lengthen the
+        # lookahead so the vehicle straightens without weaving.
+        phase = "ALIGN"
+        abs_lateral = abs(lateral)
+        if abs_lateral > 0.010:
+            lookahead = 0.14
+        elif abs_lateral > 0.006:
+            lookahead = 0.25
+        else:
+            lookahead = 0.48
+        desired_heading = -float(np.arctan2(lateral, lookahead))
+        heading_gain = 2.00
+        lateral_gain = 0.35
+        steering_limit = np.deg2rad(29.0 if not far_bay else 33.0)
+        max_delta = np.deg2rad(14.0 if not far_bay else 15.0)
+
+    heading_error = desired_heading - heading
+    target_steering = heading_gain * heading_error - lateral_gain * lateral
+    if phase == "CROSS" and forward > BAY_MOUTH_FORWARD + 0.20:
+        target_steering += 0.02 * bearing
+    target_steering = float(np.clip(target_steering, -steering_limit, steering_limit))
+
+    filtered = 0.25 * float(_last_steering) + 0.75 * target_steering
+    steering_forward = float(np.clip(
+        filtered,
+        float(_last_steering) - max_delta,
+        float(_last_steering) + max_delta,
+    ))
+    steering_forward = float(np.clip(steering_forward, -steering_limit, steering_limit))
+
+    # The target is the bay middle, and parking requires all three coordinates
+    # to agree simultaneously for several consecutive frames.
+    # Tight but attainable envelope; Bay 1 allows slightly more heading error
+    # because of its longer, harder crossing. All three must pass at once.
+    lateral_tol = 0.006 if not far_bay else 0.011
+    heading_tol = np.deg2rad(1.5 if not far_bay else 2.5)
+    depth_tol = 0.012
+    lateral_ok = abs(lateral) <= lateral_tol
+    heading_ok = abs(heading) <= heading_tol
+    depth_ok = abs(depth_error) <= depth_tol
+    if lateral_ok and heading_ok and depth_ok:
+        _parked_frames += 1
+        _last_steering = 0.0
+        if _parked_frames >= 4:
+            print(f"[PARK] parked: lat={lateral:+.3f}m, heading={np.rad2deg(heading):+.2f}deg, forward={forward:.3f}m")
+            return 0.0, 0.0, True
+        return 0.0, 0.0, False
+    _parked_frames = 0
+
+    # Use useful speed during the long approach, then taper near the middle.
+    # The previous speed schedule spent most of the 120 s budget creeping at
+    # 0.045-0.10 rad/s, despite still being short of the target.
+    if phase == "CROSS":
+        speed = 0.95 if forward > BAY_MOUTH_FORWARD + 0.10 else 0.70
+    elif phase == "CENTER":
+        if forward > BAY_MOUTH_FORWARD + 0.15:
+            speed = 0.95
+        elif forward > BAY_MOUTH_FORWARD + 0.06:
+            speed = 0.70
+        elif forward > BAY_MIDDLE_FORWARD + 0.05:
+            speed = 0.42
+        elif depth_error > depth_tol:
+            speed = min(0.25, max(0.16, 1.2 * depth_error))
+        else:
+            speed = -0.15 if depth_error < -depth_tol else 0.14
+    else:  # ALIGN
+        if forward > BAY_MOUTH_FORWARD + 0.20:
+            speed = 1.00
+        elif forward > BAY_MOUTH_FORWARD + 0.10:
+            speed = 0.80
+        elif forward > BAY_MOUTH_FORWARD:
+            speed = 0.60
+        elif forward > BAY_MIDDLE_FORWARD + 0.06:
+            speed = 0.38
+        elif forward > BAY_MIDDLE_FORWARD + 0.025:
+            speed = 0.26
+        elif depth_error > depth_tol:
+            speed = min(0.24, max(0.16, 2.0 * depth_error))
+        elif depth_error < -depth_tol:
+            speed = max(-0.22, min(-0.15, 2.0 * depth_error))
+        elif lateral_ok and heading_ok:
+            speed = 0.0
+        else:
+            if depth_error > 0.010:
+                _align_direction = 1.0
+            elif depth_error < -0.010:
+                _align_direction = -1.0
+            speed = 0.16 * _align_direction
+
+    steering = -steering_forward if speed < 0.0 else steering_forward
+    _last_steering = steering_forward
+
+    if _progress_count % 40 == 0:
+        print(f"[PARK] bay={TARGET_ID} phase={phase} lat={lateral:+.3f}m head={np.rad2deg(heading):+.1f}deg forward={forward:.3f}m speed={speed:+.3f} crossed={_crossing_done}")
+    return float(steering), float(speed), False
+
 
 
 ##############################################################
