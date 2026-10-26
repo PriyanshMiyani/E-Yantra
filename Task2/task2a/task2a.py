@@ -23,7 +23,7 @@
 # Author List:      Priyansh Miyani 
 # Filename:         task2a.py
 # Functions:        detect_lane, compute_control
-# Global variables: last_detection = last_white_fit, last_yellow_fit , last_center_fit, smooth_center , lane_width, base_lane_width, lane_side , lane_locked, missing_center , last_steering , last_speed , white_center_offset, yellow_center_offset , control_count , smooth_heading 
+# Global variables: last_detection,last_white_fit,last_yellow_fit,last_center_fit,smooth_center,lane_width,base_lane_width,lane_side,lane_locked,missing_center,last_steering,last_speed,white_center_offset,yellow_center_offset ,control_count ,smooth_heading, trace_count  
 
 
 ####################### IMPORT MODULES #######################
@@ -72,6 +72,7 @@ white_center_offset = None
 yellow_center_offset = None
 control_count = 0
 smooth_heading = None
+trace_count = 0
 
 def detect_lane(frame):
     '''
@@ -116,7 +117,9 @@ def detect_lane(frame):
     global last_detection, last_white_fit, last_yellow_fit
     global last_center_fit, smooth_center, lane_width, lane_side
     global lane_locked, missing_center
-    global white_center_offset, yellow_center_offset, base_lane_width, smooth_heading
+    global white_center_offset, yellow_center_offset, base_lane_width, smooth_heading, trace_count
+
+    
 
     if frame is None:
         missing_center += 1
@@ -129,7 +132,7 @@ def detect_lane(frame):
         return None
 
     image_center = w / 2.0
-    target_y = h * 0.68
+    target_y = h * 0.65
     horizon_y = h * 0.22
 
     rows = [
@@ -266,6 +269,21 @@ def detect_lane(frame):
 
         return chosen
 
+    def fit_is_plausible(fit):
+        """Reject a fit that points off-screen or has an implausible slope."""
+        if fit is None:
+            return False
+        test_y = np.asarray([h * 0.48, h * 0.62, h * 0.80], dtype=float)
+        test_x = np.polyval(fit, test_y)
+        slope = float(2.0 * fit[0] * (h * 0.62) + fit[1])
+        return bool(
+            np.all(np.isfinite(test_x))
+            and np.all(test_x >= -0.08 * w)
+            and np.all(test_x <= 1.08 * w)
+            and np.isfinite(slope)
+            and abs(slope) <= 4.5
+        )
+
     def width_at_row(y):
         if lane_width <= 0.0:
             return 0.28 * w
@@ -279,10 +297,19 @@ def detect_lane(frame):
         return lane_width * scale
 
     def offset_from_boundary(fit, direction):
-        # Offset the visible boundary to estimate the lane centre.
-        result = fit.copy()
-        result[2] += direction * lane_width / 2.0
-        return result
+        # Estimate the centre from one visible boundary, allowing lane width
+        # to grow toward the bottom of the perspective image.
+        sample_y = np.asarray(
+            [h * r for r in (0.34, 0.40, 0.48, 0.56, 0.64, 0.72, 0.80, 0.86)],
+            dtype=float,
+        )
+        edge_x = np.polyval(fit, sample_y)
+        center_x = np.asarray(
+            [edge_x[i] + direction * width_at_row(float(y)) / 2.0
+             for i, y in enumerate(sample_y)],
+            dtype=float,
+        )
+        return np.asarray(np.polyfit(sample_y, center_x, 2), dtype=float)
 
     row_data = [
         (y, get_groups(white, y), get_groups(yellow, y))
@@ -291,15 +318,24 @@ def detect_lane(frame):
 
     white_fit = None
     yellow_fit = None
+    boundary_reacquired = False
 
     # First frame: identify which white and yellow markings
     # enclose the lane nearest the vehicle's forward path.
     if not lane_locked:
         white_points = []
         yellow_points = []
+        white_any_points = []
+        yellow_any_points = []
         previous_pair = None
 
         for y, whites, yellows in row_data:
+            # Record each marking independently too. The evaluator can start
+            # with a bend image where only the yellow boundary is visible.
+            if whites:
+                white_any_points.append((y, min(whites, key=lambda x: abs(x - image_center))))
+            if yellows:
+                yellow_any_points.append((y, min(yellows, key=lambda x: abs(x - image_center))))
             if not whites or not yellows:
                 continue
 
@@ -317,61 +353,101 @@ def detect_lane(frame):
                         continue
 
                     middle = (wx + yx) / 2.0
-
                     if not (0.05 * w <= middle <= 0.95 * w):
                         continue
 
                     score = 0.80 * abs(middle - image_center)
                     score += 0.10 * abs(separation - 0.48 * w)
-
                     if previous_pair is not None:
                         prev_w, prev_y, prev_mid = previous_pair
-
                         score += 0.30 * abs(middle - prev_mid)
                         score += 0.10 * abs(wx - prev_w)
                         score += 0.10 * abs(yx - prev_y)
-
                     if score < best_score:
                         best_score = score
                         best_pair = (wx, yx, middle)
 
             if best_pair is not None:
                 wx, yx, middle = best_pair
-
                 white_points.append((y, wx))
                 yellow_points.append((y, yx))
-
                 previous_pair = (wx, yx, middle)
 
         white_fit = fit_curve(white_points)
         yellow_fit = fit_curve(yellow_points)
+        if not fit_is_plausible(white_fit):
+            white_fit = None
+        if not fit_is_plausible(yellow_fit):
+            yellow_fit = None
 
         if white_fit is None or yellow_fit is None:
-            missing_center += 1
-            return None
+            # Bootstrap from one visible boundary instead of returning None
+            # forever when a cold start happens at a bend.
+            if white_fit is None:
+                white_fit = fit_curve(white_any_points)
+            if yellow_fit is None:
+                yellow_fit = fit_curve(yellow_any_points)
+            if not fit_is_plausible(white_fit):
+                white_fit = None
+            if not fit_is_plausible(yellow_fit):
+                yellow_fit = None
 
-        wx = float(np.polyval(white_fit, target_y))
-        yx = float(np.polyval(yellow_fit, target_y))
+            if white_fit is not None and yellow_fit is None:
+                boundary_x = float(np.polyval(white_fit, target_y))
+                if not np.isfinite(boundary_x) or not (0 <= boundary_x < w):
+                    missing_center += 1
+                    return None
+                lane_width = base_lane_width = 0.60 * w
+                # Divider to the right -> outer lane; divider to the left -> inner lane.
+                lane_side = -1 if boundary_x > image_center else 1
+                last_white_fit = white_fit.copy()
+                estimated_center = offset_from_boundary(white_fit, lane_side)
+                white_center_offset = estimated_center - white_fit
+                last_center_fit = estimated_center.copy()
+                lane_locked = True
+                boundary_reacquired = True
+                missing_center = 0
+            elif yellow_fit is not None and white_fit is None:
+                boundary_x = float(np.polyval(yellow_fit, target_y))
+                if not np.isfinite(boundary_x) or not (0 <= boundary_x < w):
+                    missing_center += 1
+                    return None
+                lane_width = base_lane_width = 0.60 * w
+                # A yellow boundary left of centre usually borders the outer lane;
+                # a yellow boundary right of centre borders the inner lane.
+                lane_side = -1 if boundary_x < image_center else 1
+                last_yellow_fit = yellow_fit.copy()
+                estimated_center = offset_from_boundary(yellow_fit, -lane_side)
+                yellow_center_offset = estimated_center - yellow_fit
+                last_center_fit = estimated_center.copy()
+                lane_locked = True
+                boundary_reacquired = True
+                missing_center = 0
+            else:
+                missing_center += 1
+                return None
+        else:
+            wx = float(np.polyval(white_fit, target_y))
+            yx = float(np.polyval(yellow_fit, target_y))
+            separation = abs(yx - wx)
+            center_x = (wx + yx) / 2.0
 
-        separation = abs(yx - wx)
-        center_x = (wx + yx) / 2.0
+            if not (
+                0 <= wx < w
+                and 0 <= yx < w
+                and 0 <= center_x < w
+            ):
+                missing_center += 1
+                return None
 
-        if not (
-            0 <= wx < w
-            and 0 <= yx < w
-            and 0 <= center_x < w
-        ):
-            missing_center += 1
-            return None
+            if not (0.08 * w <= separation <= 0.82 * w):
+                missing_center += 1
+                return None
 
-        if not (0.08 * w <= separation <= 0.82 * w):
-            missing_center += 1
-            return None
-
-        lane_side = 1 if yx > wx else -1
-        lane_locked = True
-        lane_width = separation
-        base_lane_width = separation
+            lane_side = 1 if yx > wx else -1
+            lane_locked = True
+            lane_width = separation
+            base_lane_width = separation
 
     else:
         # Subsequent frames: follow the previously identified curves.
@@ -380,8 +456,11 @@ def detect_lane(frame):
 
         max_jump = max(
             0.06 * w,
-            0.16 * min(max(lane_width, 1.0),0.60 * w)
+            0.16 * min(max(lane_width, 1.0), 0.60 * w)
         )
+        # A bend can move a valid marking farther than the strict tracking gate.
+        # Use a wider, bounded reacquisition gate before falling back to stale data.
+        reacquire_jump = max(0.22 * w, 0.55 * min(max(lane_width, 1.0), 0.70 * w))
 
         for y, whites, yellows in row_data:
             if last_white_fit is not None:
@@ -401,6 +480,10 @@ def detect_lane(frame):
             wx = choose_near(
                 whites, white_expected, max_jump
             )
+            if wx is None:
+                wx = choose_near(
+                    whites, white_expected, reacquire_jump
+                )
 
             if wx is not None:
                 white_points.append((y, wx))
@@ -435,7 +518,7 @@ def detect_lane(frame):
                 ):
                     continue
 
-                if abs(yx - yellow_expected) > max_jump:
+                if abs(yx - yellow_expected) > reacquire_jump:
                     continue
 
                 possible.append(yx)
@@ -461,7 +544,7 @@ def detect_lane(frame):
                 np.polyval(white_fit, target_y)
             )
 
-            if abs(new_x - old_x) > 0.18 * w:
+            if abs(new_x - old_x) > 0.12 * w:
                 white_fit = None
 
         if yellow_fit is not None and last_yellow_fit is not None:
@@ -473,8 +556,50 @@ def detect_lane(frame):
                 np.polyval(yellow_fit, target_y)
             )
 
-            if abs(new_x - old_x) > 0.18 * w:
+            if abs(new_x - old_x) > 0.12 * w:
                 yellow_fit = None
+
+        # The dashed white divider can leave the camera view on a tight bend.
+        # If normal tracking rejects the yellow boundary as a large jump, try
+        # fitting the visible yellow line directly across the sampled rows.
+        # This prevents reusing an old straight-ahead centre while the vehicle
+        # is actually entering a curve. Only do this after a lane was locked,
+        # and require a coherent fit supported by at least five rows.
+        if lane_locked and yellow_fit is None:
+            reacquire_points = []
+            for y, whites, yellows in row_data:
+                if len(yellows) == 1:
+                    reacquire_points.append((y, yellows[0]))
+                elif len(yellows) > 1 and last_yellow_fit is not None:
+                    expected_yellow = float(np.polyval(last_yellow_fit, y))
+                    candidate_yellow = min(
+                        yellows, key=lambda x: abs(x - expected_yellow)
+                    )
+                    if abs(candidate_yellow - expected_yellow) <= 0.45 * w:
+                        reacquire_points.append((y, candidate_yellow))
+
+            reacquired_fit = fit_curve(reacquire_points)
+            if reacquired_fit is not None and len(reacquire_points) >= 5:
+                near_x = float(np.polyval(reacquired_fit, target_y))
+                mid_x = float(np.polyval(reacquired_fit, h * 0.55))
+                slope_check = float(
+                    2.0 * reacquired_fit[0] * (h * 0.70) + reacquired_fit[1]
+                )
+                if (
+                    np.isfinite(near_x)
+                    and np.isfinite(mid_x)
+                    and 0.0 <= near_x < w
+                    and 0.0 <= mid_x < w
+                    and abs(slope_check) <= 5.0
+                ):
+                    yellow_fit = reacquired_fit
+                    boundary_reacquired = True
+
+    # Final sanity check for individual fits before using either as a boundary.
+    if not fit_is_plausible(white_fit):
+        white_fit = None
+    if not fit_is_plausible(yellow_fit):
+        yellow_fit = None
 
     # Check the two curves at several road positions.
     pair_ok = False
@@ -494,12 +619,16 @@ def detect_lane(frame):
         )
 
         target_separation = abs(target_yellow - target_white)
+        # Perspective and camera yaw can change apparent lane width noticeably.
+        # A narrow 0.85..1.10 gate can reject valid boundaries indefinitely,
+        # forcing single-boundary recovery on every frame. Allow reasonable
+        # width variation; the row-by-row checks below still reject bad pairs.
         width_ok = (
             base_lane_width <= 0.0
             or (
-                0.85 * base_lane_width
+                0.55 * base_lane_width
                 <= target_separation
-                <= 1.10 * base_lane_width
+                <= 1.45 * base_lane_width
             )
         )
 
@@ -535,8 +664,14 @@ def detect_lane(frame):
         if good_rows < 3:
             pair_ok = False
 
+    # A large boundary reacquisition means the camera view has changed sharply
+    # (typically entering a bend). Re-bootstrap the apparent lane width rather
+    # than carrying a stale pixel width from the previous view.
+    if boundary_reacquired and not pair_ok:
+        lane_width = 0.60 * w
+
     center_fit = None
-    recovered = False
+    recovered = bool(boundary_reacquired)
 
     if pair_ok:
         # Both boundaries are valid, so use their midpoint.
@@ -552,42 +687,41 @@ def detect_lane(frame):
                 lane_width = measured_width
             else:
                 lane_width = (
-                    0.95 * lane_width
-                    + 0.05 * measured_width
+                    0.90 * lane_width
+                    + 0.10 * measured_width
+                )
+
+            # Update the reference width gradually too, so a legitimate
+            # perspective/yaw change does not keep the detector in fallback.
+            if base_lane_width <= 0:
+                base_lane_width = measured_width
+            else:
+                base_lane_width = (
+                    0.94 * base_lane_width
+                    + 0.06 * measured_width
                 )
 
         last_white_fit = white_fit.copy()
         last_yellow_fit = yellow_fit.copy()
 
-    elif lane_locked and lane_side != 0 and white_fit is not None:
-        # Use the learned curve offset from the white divider.
-        if white_center_offset is not None:
-            center_fit = white_fit + white_center_offset
-            recovered = True
-        else:
-            center_fit = offset_from_boundary(
-                white_fit, lane_side
-            )
-            recovered = True
-
     elif lane_locked and lane_side != 0 and yellow_fit is not None:
-        # Use the learned curve offset from the yellow boundary.
-        if yellow_center_offset is not None:
-            center_fit = yellow_fit + yellow_center_offset
-            recovered = True
-        else:
-            center_fit = offset_from_boundary(
-                yellow_fit, -lane_side
-            )
-            recovered = True
-
+        # When the pair is not geometrically consistent, prefer the continuous
+        # yellow road edge over a dashed-white fit that may belong to a fragment.
+        # Recompute the half-lane offset from the current width estimate; an offset
+        # learned from another camera pose can be hundreds of pixels stale.
+        center_fit = offset_from_boundary(yellow_fit, -lane_side)
         recovered = True
         last_yellow_fit = yellow_fit.copy()
+
+    elif lane_locked and lane_side != 0 and white_fit is not None:
+        # Fall back to the white divider only when the yellow edge is unavailable.
+        center_fit = offset_from_boundary(white_fit, lane_side)
+        recovered = True
 
     if center_fit is None:
         missing_center += 1
 
-        if last_center_fit is not None and missing_center <= 3:
+        if last_center_fit is not None and missing_center <= 12:
             center_fit = last_center_fit.copy()
             recovered = True
         else:
@@ -623,19 +757,30 @@ def detect_lane(frame):
             return None
 
     center_x = raw_center
+    # Keep the stored centre aligned with the newest valid boundary-based fit.
+    # Otherwise the fallback can keep steering toward a stale straight-line centre.
+    last_center_fit = center_fit.copy()
 
     if smooth_center is None:
         smooth_center = center_x
     else:
-        alpha = 0.20 if recovered else 0.42
+        # Respond more promptly when a boundary is reacquired or only one
+        # boundary is available; excessive smoothing leaves the centre behind
+        # on tight turns.
+        if boundary_reacquired:
+            alpha = 0.80
+        elif recovered:
+            alpha = 0.62
+        else:
+            alpha = 0.52
 
         smooth_center = (
             (1.0 - alpha) * smooth_center
             + alpha * center_x
         )
 
-    # Estimate heading closer to the vehicle to reduce early turning.
-    heading_y = h * 0.80
+    # Use a farther look-ahead point so the controller sees the bend earlier.
+    heading_y = h * 0.62
 
     slope = float(
         2.0 * center_fit[0] * heading_y
@@ -649,8 +794,8 @@ def detect_lane(frame):
         smooth_heading = raw_heading
     else:
         smooth_heading = (
-            0.75 * smooth_heading
-            + 0.25 * raw_heading
+            0.55 * smooth_heading
+            + 0.45 * raw_heading
         )
 
     heading_error = smooth_heading
@@ -693,14 +838,42 @@ def detect_lane(frame):
     }
 
     last_detection = detection
-    print(
-        f"[FOLLOW] center={smooth_center:.1f}, "
-        f"cte={cross_track:.1f}, "
-        f"heading={heading_error:.3f}, "
-        f"width={lane_width:.1f}, "
-        f"recovered={recovered}"
-    )
+    trace_count += 1
+    if trace_count % 80 == 1:
+        print(
+            f"[FOLLOW] center={smooth_center:.1f}, "
+            f"cte={cross_track:.1f}, "
+            f"heading={heading_error:.3f}, "
+            f"width={lane_width:.1f}, "
+            f"recovered={recovered}"
+        )
     return detection
+
+def ackermann_wheel_angles(steering):
+    """Split one centre steering command into the two front-wheel angles."""
+    import math
+
+    wheelbase = 0.120
+    # Task 1B defines the complete front track width as 0.110 m. The Ackermann
+    # equations below use half of that width on each side of the turn radius.
+    track_width = 0.110
+    max_centre_angle = 0.58  # keeps the inner wheel within the 45-degree limit
+    steering = max(-max_centre_angle, min(max_centre_angle, float(steering)))
+
+    if abs(steering) < 0.001:
+        return 0.0, 0.0
+
+    radius = wheelbase / abs(math.tan(steering))
+    inside_radius = max(0.01, radius - track_width / 2.0)
+    inner = math.atan(wheelbase / inside_radius)
+    outer = math.atan(wheelbase / (radius + track_width / 2.0))
+    max_wheel_angle = math.radians(45.0)
+    inner = min(inner, max_wheel_angle)
+    outer = min(outer, max_wheel_angle)
+
+    if steering > 0.0:
+        return float(inner), float(outer)
+    return float(-outer), float(-inner)
 
 
 def compute_control(detection, stop_requested):
@@ -757,132 +930,83 @@ def compute_control(detection, stop_requested):
 
     global last_steering, last_speed, last_detection, control_count
 
-    # Always obey the evaluator's stop signal.
     if stop_requested:
-        last_steering = 0.0
+        # Keep the steering state through a stop; resume smoothly when the
+        # evaluator lowers the flag. The motors remain stationary while raised.
         last_speed = 0.0
-        return 0.0, 0.0, 0.0
+        left_angle, right_angle = ackermann_wheel_angles(last_steering)
+        return left_angle, right_angle, 0.0
 
     if detection is None:
-        if last_detection is not None and missing_center <= 2:
+        if last_detection is not None and missing_center <= 12:
+            # Keep the last steering briefly while lane markings are reacquired.
             steering = last_steering
-            speed = 0.10
+            speed = 0.26
         else:
-            last_steering = 0.0
             last_speed = 0.0
-            return 0.0, 0.0, 0.0
-
+            left_angle, right_angle = ackermann_wheel_angles(last_steering)
+            return left_angle, right_angle, 0.0
     else:
         last_detection = detection
-
         error = (
-            detection["cross_track_error_px"]
-            / max(detection["lane_width_px"], 1.0)
+            float(detection["cross_track_error_px"])
+            / max(float(detection["lane_width_px"]), 1.0)
         )
+        heading = float(detection["heading_error"])
 
-        heading = detection["heading_error"]
-
-        # Small errors should not cause continual steering corrections.
         if abs(error) < 0.025:
             error = 0.0
 
-        # Stanley-style steering: align with the road, then correct offset.
+        # Combine lateral correction with a small heading correction. In this
+        # camera coordinate system, the heading term has the opposite sign.
         correction = math.atan(
-            0.90 * error / (0.40 + max(last_speed, 0.0))
+            1.60 * error / (0.35 + max(last_speed, 0.0))
         )
-
-        desired = 0.30 * heading + correction
+        desired = -0.15 * heading + correction
         desired = max(-0.58, min(0.58, desired))
 
-        # Smooth steering without forcing a turn in either direction.
-        steering = (
-            0.68 * last_steering
-            + 0.32 * desired
-        )
-
-        # Limit the change in either direction.
-        steering = max(
-            last_steering - 0.05,
-            min(last_steering + 0.05, steering)
-        )
-
+        # Smooth steering, but permit a quick enough change to enter bends.
+        steering = 0.40 * last_steering + 0.60 * desired
+        steering = max(last_steering - 0.20, min(last_steering + 0.20, steering))
         steering = max(-0.58, min(0.58, steering))
         last_steering = steering
 
+        # Adjust motor speed to the curvature and the quality of lane tracking.
         if detection.get("recovered", False):
-            speed = 0.16
-        elif abs(heading) > 0.45 or abs(desired) > 0.45:
-            speed = 0.18
-        elif abs(heading) > 0.28 or abs(desired) > 0.30:
-            speed = 0.24
-        elif abs(heading) > 0.15 or abs(desired) > 0.18:
-            speed = 0.32
-        else:
+            speed = 0.38
+        elif abs(heading) > 0.48 or abs(desired) > 0.48:
             speed = 0.42
-
-    # Ackermann steering geometry.
-    # Positive angles turn left; the inside wheel gets the larger angle.
-    wheelbase = 0.120
-    track = 0.055
-
-    if abs(steering) < 0.001:
-        left_angle = 0.0
-        right_angle = 0.0
-
-    else:
-        radius = wheelbase / abs(math.tan(steering))
-
-        inner = math.atan(
-            wheelbase / max(0.01, radius - track / 2.0)
-        )
-
-        outer = math.atan(
-            wheelbase / (radius + track / 2.0)
-        )
-
-        if steering > 0:
-            left_angle = inner
-            right_angle = outer
+        elif abs(heading) > 0.30 or abs(desired) > 0.32:
+            speed = 0.52
+        elif abs(heading) > 0.16 or abs(desired) > 0.19:
+            speed = 0.62
         else:
-            left_angle = -outer
-            right_angle = -inner
+            speed = 0.75
 
-    last_speed = speed
+    left_angle, right_angle = ackermann_wheel_angles(steering)
+    last_speed = float(speed)
 
-    if detection is None:
-        print(
-            f"[CTRL] detection=None, "
-            f"missing={missing_center}, speed={speed:.2f}"
-        )
-    elif abs(heading) > 0.15 or abs(error) > 0.04:
-        print(
-            f"[TURN] lane={detection['lane']}, "
-            f"cte={detection['cross_track_error_px']:.1f}, "
-            f"heading={heading:.3f}, "
-            f"desired={desired:.3f}, "
-            f"steering={steering:.3f}, "
-            f"left={left_angle:.3f}, "
-            f"right={right_angle:.3f}, "
-            f"speed={speed:.2f}"
-        )
-    if control_count < 25:
-        if detection is not None:
+    # Keep terminal output light; per-frame printing can slow the evaluator.
+    if control_count < 15:
+        if detection is None:
+            print(f"[CTRL] detection=None, missing={missing_center}, speed={speed:.2f}")
+        else:
             print(
                 f"[CTRL] cte={detection['cross_track_error_px']:.1f}, "
                 f"heading={detection['heading_error']:.3f}, "
-                f"desired={desired:.3f}, "
-                f"steering={steering:.3f}, "
-                f"speed={speed:.2f}"
+                f"steering={steering:.3f}, speed={speed:.2f}"
             )
-        else:
-            print(
-                f"[CTRL] detection=None, "
-                f"missing={missing_center}, speed={speed:.2f}"
-            )
-
-        control_count += 1
-
-    return (float(left_angle),float(right_angle),float(speed))
+    elif detection is not None and trace_count % 80 == 0 and (
+        abs(detection['heading_error']) > 0.20 or abs(error) > 0.08
+    ):
+        print(
+            f"[TURN] lane={detection['lane']}, "
+            f"cte={detection['cross_track_error_px']:.1f}, "
+            f"heading={detection['heading_error']:.3f}, "
+            f"steering={steering:.3f}, speed={speed:.2f}"
+        )
+    control_count += 1
+    return float(left_angle), float(right_angle), float(speed)
 
 
 ##############################################################
